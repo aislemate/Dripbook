@@ -1,0 +1,9 @@
+{
+  "name": "dripbook",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "stripe": "^17.0.0"
+  }
+}
