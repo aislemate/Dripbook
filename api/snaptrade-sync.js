@@ -9,10 +9,13 @@ import { Snaptrade } from "snaptrade-typescript-sdk";
 
 const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_4rtnWGGUaEnX4NTF8-iBiA_D8vJAAa4";
 
-const snaptrade = new Snaptrade({
-  clientId: process.env.SNAPTRADE_CLIENT_ID,
-  consumerKey: process.env.SNAPTRADE_CONSUMER_KEY,
-});
+function makeClient() {
+  const clientId = (process.env.SNAPTRADE_CLIENT_ID || "").trim();
+  const consumerKey = (process.env.SNAPTRADE_CONSUMER_KEY || "").trim();
+  if (!clientId) throw new Error("SNAPTRADE_CLIENT_ID is not set in Vercel");
+  if (!consumerKey) throw new Error("SNAPTRADE_CONSUMER_KEY is not set in Vercel");
+  return new Snaptrade({ clientId, consumerKey });
+}
 
 const sbHeaders = (extra = {}) => ({
   apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
@@ -45,6 +48,8 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
 
   try {
+    const snaptrade = makeClient();
+
     const token = (req.headers.authorization || "").replace("Bearer ", "");
     if (!token) return res.status(401).json({ error: "Not signed in" });
 
