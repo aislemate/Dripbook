@@ -1,62 +1,76 @@
 // api/webhook.js — Stripe tells us what happened; we update the database.
 // This is the ONLY thing that grants Pro. The browser can never set it.
+//
+// Uses the Web handler signature (Request in, Response out). Vercel parses
+// the body on the older Node signature, which breaks Stripe's signature
+// check. request.text() here gives the untouched raw payload.
 
 import Stripe from "stripe";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// Signature checking needs the raw body, so turn off automatic parsing.
-export const config = { api: { bodyParser: false } };
-
-function rawBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
-  });
-}
-
 async function setPlan(uid, fields) {
-  if (!uid) return;
-  await fetch(`${process.env.SUPABASE_URL}/rest/v1/profiles?id=eq.${uid}`, {
+  if (!uid) {
+    console.error("no supabase uid — skipping update");
+    return;
+  }
+  const res = await fetch(`${process.env.SUPABASE_URL}/rest/v1/profiles?id=eq.${uid}`, {
     method: "PATCH",
     headers: {
       apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
       "Content-Type": "application/json",
+      Prefer: "return=representation",
     },
     body: JSON.stringify(fields),
   });
+  const text = await res.text();
+  console.log("supabase update", res.status, text.slice(0, 300));
+  if (!res.ok) throw new Error(`Supabase write failed: ${res.status} ${text.slice(0, 200)}`);
 }
 
-// Find the Supabase user behind a Stripe customer, even if metadata is missing.
+// Find the Supabase user behind a Stripe customer, however we can.
 async function uidFor(sub) {
   if (sub.metadata?.supabase_uid) return sub.metadata.supabase_uid;
-  const customer = await stripe.customers.retrieve(sub.customer);
-  if (customer?.metadata?.supabase_uid) return customer.metadata.supabase_uid;
+
+  try {
+    const customer = await stripe.customers.retrieve(sub.customer);
+    if (customer?.metadata?.supabase_uid) return customer.metadata.supabase_uid;
+  } catch (e) {
+    console.error("customer lookup failed:", e.message);
+  }
+
   const res = await fetch(
     `${process.env.SUPABASE_URL}/rest/v1/profiles?stripe_customer_id=eq.${sub.customer}&select=id`,
-    { headers: { apikey: process.env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}` } }
+    {
+      headers: {
+        apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    }
   );
-  const [row] = await res.json();
-  return row?.id;
+  const rows = await res.json();
+  return rows?.[0]?.id;
 }
 
-export default async function handler(req, res) {
+export default async function handler(request) {
+  const signature = request.headers.get("stripe-signature");
+  const raw = await request.text();
+
   let event;
   try {
-    const body = await rawBody(req);
-    event = stripe.webhooks.constructEvent(
-      body,
-      req.headers["stripe-signature"],
+    event = await stripe.webhooks.constructEventAsync(
+      raw,
+      signature,
       process.env.STRIPE_WEBHOOK_SECRET
     );
   } catch (err) {
     // A bad signature means this did not come from Stripe. Reject it.
-    console.error("bad signature:", err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+    console.error("signature check failed:", err.message);
+    return new Response(`Webhook Error: ${err.message}`, { status: 400 });
   }
+
+  console.log("received event:", event.type);
 
   try {
     switch (event.type) {
@@ -70,32 +84,40 @@ export default async function handler(req, res) {
           plan: live ? "pro" : "free",
           plan_status: sub.status === "unpaid" ? "canceled" : sub.status,
           stripe_subscription_id: sub.id,
-          current_period_end: new Date(sub.current_period_end * 1000).toISOString(),
+          current_period_end: sub.current_period_end
+            ? new Date(sub.current_period_end * 1000).toISOString()
+            : null,
         });
         break;
       }
 
       case "checkout.session.completed": {
-        // Belt and braces: the subscription events above usually land first,
-        // but if they are delayed the user still gets access immediately.
+        // Belt and braces: usually the subscription event lands first, but if
+        // it is delayed the buyer still gets access straight away.
         const s = event.data.object;
         if (s.subscription) {
           const sub = await stripe.subscriptions.retrieve(s.subscription);
-          await setPlan(s.metadata?.supabase_uid || (await uidFor(sub)), {
+          const uid = s.metadata?.supabase_uid || (await uidFor(sub));
+          await setPlan(uid, {
             plan: "pro",
             plan_status: sub.status,
             stripe_subscription_id: sub.id,
             stripe_customer_id: s.customer,
-            current_period_end: new Date(sub.current_period_end * 1000).toISOString(),
+            current_period_end: sub.current_period_end
+              ? new Date(sub.current_period_end * 1000).toISOString()
+              : null,
           });
         }
         break;
       }
     }
   } catch (err) {
-    console.error("handler error:", err);
-    return res.status(500).send("Handler failed");
+    console.error("handler error:", err.message);
+    return new Response(`Handler failed: ${err.message}`, { status: 500 });
   }
 
-  return res.status(200).json({ received: true });
+  return new Response(JSON.stringify({ received: true }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
 }
