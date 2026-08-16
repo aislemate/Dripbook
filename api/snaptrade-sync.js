@@ -83,12 +83,18 @@ export default async function handler(req, res) {
       return res.status(200).json({ imported: 0, updated: 0, accounts: 0, message: "No accounts linked yet." });
     }
 
-    // 2. Pull positions from each.
+    // 2. Pull positions and cash from each.
     const found = new Map();
     let brokerName = null;
+    let cash = 0;
 
     for (const acct of accounts) {
       brokerName = brokerName || acct.institution_name || acct.brokerage?.name || null;
+
+      // Uninvested cash pays no dividends, but pretending it isn't there
+      // overstates yield and hides how much is actually in the market.
+      const bal = acct.balance?.total?.amount ?? acct.cash ?? null;
+      if (bal != null) cash += num(bal);
       let positions = [];
       try {
         const h = await snaptrade.accountInformation.getUserHoldings({
@@ -96,6 +102,10 @@ export default async function handler(req, res) {
           accountId: acct.id,
         });
         positions = h.data?.positions || h.data?.position || [];
+        const hb = h.data?.balances;
+        if (Array.isArray(hb) && acct.balance?.total?.amount == null) {
+          for (const b of hb) cash += num(b.cash ?? b.amount ?? 0);
+        }
       } catch (e) {
         console.error(`positions failed for account ${acct.id}:`, e?.responseBody || e.message);
         continue;
@@ -171,6 +181,37 @@ export default async function handler(req, res) {
       }
     }
 
+    // Cash lands as a single non-dividend holding priced at $1 a unit, so it
+    // counts toward allocation and portfolio value but never toward income.
+    const cashRow = (existing || []).find((h) => h.ticker === "CASH");
+    if (cash > 0.5) {
+      const body = {
+        shares: Math.round(cash * 100) / 100,
+        price: 1,
+        cost: 1,
+        div: 0,
+        freq: "N",
+        name: "Uninvested cash",
+        sector: "Bonds / cash",
+        source: "brokerage",
+        last_synced_at: now,
+      };
+      if (cashRow) {
+        await fetch(`${process.env.SUPABASE_URL}/rest/v1/holdings?id=eq.${cashRow.id}`, {
+          method: "PATCH", headers: sbHeaders(), body: JSON.stringify(body),
+        });
+      } else {
+        await fetch(`${process.env.SUPABASE_URL}/rest/v1/holdings`, {
+          method: "POST", headers: sbHeaders(),
+          body: JSON.stringify({ ...body, user_id: user.id, ticker: "CASH", anchor: 0 }),
+        });
+      }
+    } else if (cashRow && cash <= 0.5) {
+      await fetch(`${process.env.SUPABASE_URL}/rest/v1/holdings?id=eq.${cashRow.id}`, {
+        method: "DELETE", headers: sbHeaders(),
+      });
+    }
+
     await fetch(`${process.env.SUPABASE_URL}/rest/v1/profiles?id=eq.${user.id}`, {
       method: "PATCH",
       headers: sbHeaders(),
@@ -182,6 +223,7 @@ export default async function handler(req, res) {
       imported,
       updated,
       brokerage: brokerName,
+      cash: Math.round(cash * 100) / 100,
       // Positions arrive without dividend data — that still needs filling in.
       needsDividendInfo: imported,
     });
