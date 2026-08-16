@@ -5,10 +5,13 @@ import { Snaptrade } from "snaptrade-typescript-sdk";
 
 const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_4rtnWGGUaEnX4NTF8-iBiA_D8vJAAa4";
 
-const snaptrade = new Snaptrade({
-  clientId: process.env.SNAPTRADE_CLIENT_ID,
-  consumerKey: process.env.SNAPTRADE_CONSUMER_KEY,
-});
+function makeClient() {
+  const clientId = (process.env.SNAPTRADE_CLIENT_ID || "").trim();
+  const consumerKey = (process.env.SNAPTRADE_CONSUMER_KEY || "").trim();
+  if (!clientId) throw new Error("SNAPTRADE_CLIENT_ID is not set in Vercel");
+  if (!consumerKey) throw new Error("SNAPTRADE_CONSUMER_KEY is not set in Vercel");
+  return new Snaptrade({ clientId, consumerKey });
+}
 
 const sbHeaders = () => ({
   apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
@@ -17,10 +20,24 @@ const sbHeaders = () => ({
 });
 
 export default async function handler(req, res) {
+  // Temporary diagnostic: open this URL in a browser to see what the deployed
+  // build is holding. Shows shape, never the secrets themselves.
+  if (req.method === "GET") {
+    const shape = (v) => (v ? `${v.slice(0, 6)}… len ${v.length}` : "MISSING");
+    return res.status(200).json({
+      SNAPTRADE_CLIENT_ID: process.env.SNAPTRADE_CLIENT_ID || "MISSING",
+      SNAPTRADE_CONSUMER_KEY: shape(process.env.SNAPTRADE_CONSUMER_KEY),
+      SUPABASE_URL: process.env.SUPABASE_URL || "MISSING",
+      SUPABASE_SERVICE_ROLE_KEY: shape(process.env.SUPABASE_SERVICE_ROLE_KEY),
+    });
+  }
+
   if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
 
   try {
     // Who is asking?
+    const snaptrade = makeClient();
+
     const token = (req.headers.authorization || "").replace("Bearer ", "");
     if (!token) return res.status(401).json({ error: "Not signed in" });
 
