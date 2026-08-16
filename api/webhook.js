@@ -1,27 +1,39 @@
 // api/webhook.js — Stripe tells us what happened; we update the database.
 // This is the ONLY thing that grants Pro. The browser can never set it.
 //
-// Uses the Web handler signature (Request in, Response out). Vercel parses
-// the body on the older Node signature, which breaks Stripe's signature
-// check. request.text() here gives the untouched raw payload.
+// Runs on the edge runtime on purpose. Vercel's Node runtime parses the
+// request body before the handler sees it, which corrupts Stripe's
+// signature check. On edge we get the real raw payload from request.text().
 
 import Stripe from "stripe";
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+export const config = { runtime: "edge" };
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  httpClient: Stripe.createFetchHttpClient(),
+});
+
+// Edge has no Node crypto, so Stripe uses the browser-standard SubtleCrypto.
+const cryptoProvider = Stripe.createSubtleCryptoProvider();
+
+const SB = {
+  url: () => process.env.SUPABASE_URL,
+  key: () => process.env.SUPABASE_SERVICE_ROLE_KEY,
+  headers: () => ({
+    apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  }),
+};
 
 async function setPlan(uid, fields) {
   if (!uid) {
     console.error("no supabase uid — skipping update");
     return;
   }
-  const res = await fetch(`${process.env.SUPABASE_URL}/rest/v1/profiles?id=eq.${uid}`, {
+  const res = await fetch(`${SB.url()}/rest/v1/profiles?id=eq.${uid}`, {
     method: "PATCH",
-    headers: {
-      apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      Prefer: "return=representation",
-    },
+    headers: { ...SB.headers(), Prefer: "return=representation" },
     body: JSON.stringify(fields),
   });
   const text = await res.text();
@@ -41,13 +53,8 @@ async function uidFor(sub) {
   }
 
   const res = await fetch(
-    `${process.env.SUPABASE_URL}/rest/v1/profiles?stripe_customer_id=eq.${sub.customer}&select=id`,
-    {
-      headers: {
-        apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    }
+    `${SB.url()}/rest/v1/profiles?stripe_customer_id=eq.${sub.customer}&select=id`,
+    { headers: SB.headers() }
   );
   const rows = await res.json();
   return rows?.[0]?.id;
@@ -62,7 +69,9 @@ export default async function handler(request) {
     event = await stripe.webhooks.constructEventAsync(
       raw,
       signature,
-      process.env.STRIPE_WEBHOOK_SECRET
+      process.env.STRIPE_WEBHOOK_SECRET,
+      undefined,
+      cryptoProvider
     );
   } catch (err) {
     // A bad signature means this did not come from Stripe. Reject it.
